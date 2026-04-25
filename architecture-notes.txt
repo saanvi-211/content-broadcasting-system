@@ -1,0 +1,199 @@
+========================================
+CONTENT BROADCASTING SYSTEM
+Architecture Notes
+========================================
+
+1. AUTHENTICATION & RBAC FLOW
+------------------------------
+- JWT-based auth using jsonwebtoken
+- Passwords hashed with bcrypt (12 salt rounds)
+- On login: verify email + bcrypt.compare → issue signed JWT (24h expiry)
+- Every protected route passes through authenticate middleware:
+    1. Extract Bearer token from Authorization header
+    2. jwt.verify() with secret → decode payload (id, role)
+    3. DB lookup to confirm user still exists
+    4. Attach user object to req.user
+- authorize(...roles) middleware follows authenticate
+    - Checks req.user.role against allowed roles
+    - Returns 403 if not authorized
+- Roles: 'principal' and 'teacher' — strictly separated at route level
+- No sensitive data (password_hash) is ever returned in responses
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+- Each teacher x subject pair has a unique ContentSlot record
+- When a teacher uploads content for "Maths", the system auto-creates a
+  slot (or reuses existing) for that teacher+subject combination
+- ContentSchedule links content to a slot with rotation_order and duration
+- Subjects are stored lowercase for case-insensitive matching
+- API supports filtering by subject on all list endpoints
+
+3. UPLOAD HANDLING
+-------------------
+- Multer handles multipart/form-data
+- File filter: only jpg, jpeg, png, gif allowed (checked by both
+  mimetype AND file extension to prevent bypass attacks)
+- Max file size: 10MB (configurable via MAX_FILE_SIZE env var)
+- Files stored locally in /uploads directory with a unique timestamped filename
+- file_url (public URL path) and file_path (disk path) stored separately
+- Files served as static assets via Express: GET /uploads/<filename>
+- Bonus: S3 storage can be added by replacing multer disk storage with
+  multer-s3 and updating file_url to the S3 URL
+
+4. APPROVAL WORKFLOW
+---------------------
+Content lifecycle: pending → approved | rejected
+
+- All uploaded content defaults to 'pending' status
+- Only principals can approve or reject (enforced via RBAC middleware)
+- Approve: sets status='approved', records approved_by and approved_at
+- Reject: requires rejectionReason (validated), stores in rejection_reason field
+- Approved/rejected content cannot be re-submitted without a new upload
+- Teachers can view their content's status (including rejection reason)
+- Only approved content is ever exposed via the public broadcast API
+
+5. SCHEDULING/ROTATION LOGIC (MOST IMPORTANT)
+----------------------------------------------
+Key rules:
+  - Content must have both start_time AND end_time set to be eligible
+  - Without these fields, content is NEVER shown (even if approved)
+  - Rotation is per-subject per-teacher
+
+Algorithm (getLiveContent in scheduling.service.js):
+  Step 1: Query DB for all content where:
+    - uploaded_by = teacherId
+    - status = 'approved'
+    - start_time IS NOT NULL AND end_time IS NOT NULL
+    - start_time <= NOW() AND end_time >= NOW()
+
+  Step 2: Join with content_schedule to get rotation_order and duration
+
+  Step 3: Group results by subject
+
+  Step 4: For each subject group:
+    a) Sort items by rotation_order ASC
+    b) Calculate totalCycleDuration = sum of all item durations (in ms)
+    c) Use today's midnight UTC as epoch reference
+    d) elapsed = (NOW - epoch) % totalCycleDuration
+    e) Walk through sorted items, accumulating durations
+    f) First item where accumulatedDuration > elapsed → ACTIVE item
+
+  Step 5: Return active item per subject (or empty if none match)
+
+  Edge Cases:
+    - No approved content → { available: false, message: "No content available" }
+    - Approved but outside time window → excluded by query, returns empty
+    - Only 1 item in rotation → always that item (during its time window)
+    - Total cycle = 0 → fallback to first item
+
+  Example:
+    Maths: [A(5min), B(5min), C(5min)] → totalCycle = 15min
+    At elapsed=7min: A covers 0-5, B covers 5-10 → B is active
+    At elapsed=12min: C covers 10-15 → C is active
+    Loops continuously throughout the day
+
+6. DATABASE DESIGN DECISIONS
+------------------------------
+Tables:
+  users         - Stores principals and teachers (role field discriminates)
+  content       - Core content entity with full lifecycle fields
+  content_slots - Subject+teacher grouping for organization
+  content_schedule - Links content to slots with rotation metadata
+
+Foreign Keys:
+  content.uploaded_by → users.id (CASCADE DELETE)
+  content.approved_by → users.id (nullable)
+  content_slots.teacher_id → users.id (CASCADE DELETE)
+  content_schedule.content_id → content.id (CASCADE DELETE)
+  content_schedule.slot_id → content_slots.id (CASCADE DELETE)
+
+Indexes on:
+  content(uploaded_by), content(status), content(subject)
+  content_slots(teacher_id), content_schedule(slot_id)
+
+Design decisions:
+  - UUIDs for primary keys (security + distributed-system ready)
+  - UNIQUE constraint on content_slots(subject, teacher_id) prevents duplicates
+  - Storing both file_url (public) and file_path (disk) allows switching
+    to S3 later without data loss
+  - start_time/end_time nullable by design — NULL = never active
+
+7. FOLDER STRUCTURE
+---------------------
+src/
+  app.js              - Express app setup, middleware, route mounting
+  config/
+    database.js       - PostgreSQL pool configuration
+    migrate.js        - DB schema creation script
+    seed.js           - Demo data seeder
+    swagger.js        - Swagger/OpenAPI config
+  controllers/
+    auth.controller.js
+    content.controller.js
+    broadcast.controller.js
+  routes/
+    auth.routes.js    - /auth/* with Swagger JSDoc annotations
+    content.routes.js - /content/* (protected)
+    broadcast.routes.js - /content/live/* (public)
+  services/
+    auth.service.js
+    content.service.js
+    scheduling.service.js  - Core rotation/broadcasting logic
+  middlewares/
+    auth.middleware.js      - JWT authentication + RBAC
+    upload.middleware.js    - Multer file upload
+    rateLimiter.middleware.js - Express rate limiting
+  utils/
+    jwt.js                  - Token generation/verification
+    response.js             - Standardized API response helpers
+
+8. MIDDLEWARE USAGE
+--------------------
+Request lifecycle for a protected route:
+  Request → cors → express.json → authenticate → authorize(role) → controller
+
+For upload routes:
+  Request → cors → express.json → authenticate → authorize('teacher') → handleUpload → controller
+
+For public routes:
+  Request → cors → publicApiLimiter → controller
+
+9. SCALABILITY APPROACH
+------------------------
+Current (MVP):
+  - PostgreSQL with connection pooling (pg Pool, max 20 connections)
+  - Efficient indexes on frequently queried columns
+  - Pagination on all list endpoints
+
+Recommended additions for scale:
+
+  Caching (Redis):
+    - Cache /content/live/:teacherId responses for 30-60 seconds
+    - Invalidate on approval, rejection, or schedule changes
+    - Use ioredis + cache-aside pattern
+
+  Rate Limiting:
+    - Already implemented via express-rate-limit
+    - For higher scale: move to Redis-backed rate limiting (rate-limit-redis)
+
+  File Storage:
+    - Replace local disk with AWS S3 / Cloudflare R2
+    - Use multer-s3 for direct S3 upload
+    - Serve files via CDN for global low-latency
+
+  Queue System (for heavy approval workflows at scale):
+    - Bull/BullMQ with Redis for async notification on approval
+    - Email notifications to teachers on approve/reject
+
+  Database:
+    - Add read replicas for /content/live queries
+    - Consider partitioning content table by created_at for large datasets
+
+  Deployment:
+    - Containerize with Docker
+    - Deploy behind a load balancer (Nginx/ALB)
+    - Use PM2 for Node process management
+
+========================================
+END OF ARCHITECTURE NOTES
+========================================
