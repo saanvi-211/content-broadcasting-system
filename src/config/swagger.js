@@ -9,7 +9,8 @@ const options = {
       description: 'API for broadcasting educational content from teachers to students',
     },
     servers: [
-      { url: 'http://localhost:3000', description: 'Development server' },
+{ url: 'https://content-broadcasting-system-vrvd.onrender.com', description: 'Production server' },
+{ url: 'http://localhost:3000', description: 'Development server' },
     ],
     components: {
       securitySchemes: {
